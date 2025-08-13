@@ -1,0 +1,420 @@
+REPORT zmaint_order_print NO STANDARD PAGE HEADING.
+
+*---------------------------------------------------------------------*
+* Selection Screen
+*---------------------------------------------------------------------*
+PARAMETERS: p_aufnr TYPE aufnr OBLIGATORY.
+
+*---------------------------------------------------------------------*
+* Data type declarations
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_header_out,
+         plant_name   TYPE t001w-name1,
+         order        TYPE aufnr,
+         order_type   TYPE aufart,
+         short_text   TYPE auftext,
+         equipment    TYPE equnr,
+         act_type     TYPE ilart,
+         start_date   TYPE dats,
+         funct_loc    TYPE tplnr,
+         review       TYPE char10,
+         equi_desc    TYPE eqktx,
+         act_type_txt TYPE ilatx,
+         freq_text    TYPE ktext,
+         last_prev    TYPE dats,
+         workstation  TYPE ktext,
+         est_time_h   TYPE p DECIMALS 2,
+         required_by  TYPE innam,
+       END OF ty_header_out.
+
+TYPES: BEGIN OF ty_act_out,
+         op         TYPE vornr,
+         component  TYPE equnr,
+         mp_mt      TYPE systcond,
+         description TYPE bapi_alm_order_operation_e-description,
+         time       TYPE bapi_alm_order_operation_e-duration_normal,
+         machine    TYPE eqktx,
+         longtext   TYPE string,
+       END OF ty_act_out.
+
+TYPES: BEGIN OF ty_mat_out,
+         op          TYPE vornr,
+         material    TYPE matnr,
+         description TYPE maktx,
+         quantity    TYPE menge_d,
+         um          TYPE meins,
+         suborder    TYPE banfn,
+         reservation TYPE rsnum,
+       END OF ty_mat_out.
+
+TYPES: BEGIN OF ty_lock_out,
+         name         TYPE pa0001-ename,
+         start_date   TYPE gstrs,
+         start_time   TYPE gsuzs,
+         end_date     TYPE gltrs,
+         end_time     TYPE gluzs,
+         supervisor   TYPE ktext,
+         programmer   TYPE innam,
+         work_order   TYPE aufnr,
+         equipment    TYPE equnr,
+         job_desc     TYPE auftext,
+       END OF ty_lock_out.
+
+DATA: gs_header TYPE ty_header_out,
+      gt_act    TYPE TABLE OF ty_act_out,
+      gt_mat    TYPE TABLE OF ty_mat_out,
+      gt_lock   TYPE TABLE OF ty_lock_out.
+
+*---------------------------------------------------------------------*
+* Internal vars for processing
+*---------------------------------------------------------------------*
+DATA: lv_iwerk   TYPE iwerk,
+      lv_ingpr   TYPE ingpr,
+      lv_werks   TYPE werks_d,
+      lv_eqnr    TYPE equnr,
+      lv_ilart   TYPE ilart,
+      lv_warpl   TYPE warpl,
+      lv_wapos   TYPE wapos,
+      lv_wstra   TYPE wstra,
+      lv_laufn   TYPE aufnr,
+      lv_gewrk   TYPE gewrk,
+      lv_est_min TYPE i.
+
+DATA: ls_header_bapi     TYPE bapi_alm_order_header_e,
+      lt_operations_bapi TYPE TABLE OF bapi_alm_order_operation_e,
+      lt_components_bapi TYPE TABLE OF bapi_alm_order_component_e.
+
+*---------------------------------------------------------------------*
+* Start-of-selection
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  "-----------------------------
+  " Step 1: Get Header from BAPI
+  "-----------------------------
+  CALL FUNCTION 'BAPI_ALM_ORDER_GET_DETAIL'
+    EXPORTING
+      number        = p_aufnr
+    IMPORTING
+      es_header     = ls_header_bapi
+    TABLES
+      et_operations = lt_operations_bapi
+      et_components = lt_components_bapi
+    EXCEPTIONS
+      OTHERS        = 1.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Error retrieving order data' TYPE 'E'.
+  ENDIF.
+
+  " Fill from BAPI
+  gs_header-order      = ls_header_bapi-orderid.
+  gs_header-order_type = ls_header_bapi-order_type.
+  gs_header.short_text = ls_header_bapi-short_text.
+  gs_header-equipment  = ls_header_bapi-equipment.
+  gs_header-act_type   = ls_header_bapi-pmacttype.
+  gs_header-start_date = ls_header_bapi-start_date.
+  gs_header-funct_loc  = ls_header_bapi-funct_loc.
+  gs_header-review     = ls_header_bapi-review.
+  gs_header-plant_name = ''.
+
+  "-----------------------------
+  " Step 1b: Plant Name
+  "-----------------------------
+  SELECT SINGLE werks
+    INTO lv_werks
+    FROM viaufkst
+    WHERE aufnr = p_aufnr.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE name1
+      INTO gs_header-plant_name
+      FROM t001w
+      WHERE werks = lv_werks.
+  ENDIF.
+
+  "-----------------------------
+  " Equipment Description
+  "-----------------------------
+  SELECT SINGLE equnr
+    INTO lv_eqnr
+    FROM afih
+    WHERE aufnr = p_aufnr.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE eqktx
+      INTO gs_header-equi_desc
+      FROM equi
+      WHERE equnr = lv_eqnr.
+  ENDIF.
+
+  "-----------------------------
+  " Activity Type Description
+  "-----------------------------
+  SELECT SINGLE ilart
+    INTO lv_ilart
+    FROM afih
+    WHERE aufnr = p_aufnr.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE ilatx
+      INTO gs_header-act_type_txt
+      FROM t353i_t
+      WHERE ilart = lv_ilart
+        AND spras = sy-langu.
+  ENDIF.
+
+  "-----------------------------
+  " Frequency
+  "-----------------------------
+  SELECT SINGLE warpl wapos
+    INTO (lv_warpl, lv_wapos)
+    FROM afih
+    WHERE aufnr = p_aufnr.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE wstra
+      INTO lv_wstra
+      FROM mpos
+      WHERE warpl = lv_warpl
+        AND wapos = lv_wapos.
+
+    IF sy-subrc = 0.
+      SELECT SINGLE ktext
+        INTO gs_header-freq_text
+        FROM t351
+        WHERE wstra = lv_wstra.
+    ENDIF.
+  ENDIF.
+
+  "-----------------------------
+  " Last Preventive Maintenance
+  "-----------------------------
+  SELECT SINGLE laufn
+    INTO lv_laufn
+    FROM viaufkst
+    WHERE aufnr = p_aufnr.
+
+  IF lv_laufn IS NOT INITIAL.
+    SELECT SINGLE idat2
+      INTO gs_header-last_prev
+      FROM viaufkst
+      WHERE aufnr = lv_laufn.
+  ENDIF.
+
+  "-----------------------------
+  " Workstation Description
+  "-----------------------------
+  SELECT SINGLE gewrk
+    INTO lv_gewrk
+    FROM afih
+    WHERE aufnr = p_aufnr.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE ktext
+      INTO gs_header-workstation
+      FROM crtx
+      WHERE objid = lv_gewrk
+        AND spras = sy-langu.
+  ENDIF.
+
+  "-----------------------------
+  " Estimated Time
+  "-----------------------------
+  CLEAR: lv_est_min.
+  SELECT dauno
+    FROM viauf_afvc
+    INTO @DATA(l_dauno)
+    WHERE aufnr = @p_aufnr.
+    lv_est_min = lv_est_min + l_dauno.
+  ENDSELECT.
+  gs_header-est_time_h = lv_est_min / 60.
+
+  "-----------------------------
+  " Required By
+  "-----------------------------
+  SELECT SINGLE iwerk ingpr
+    INTO (lv_iwerk, lv_ingpr)
+    FROM afih
+    WHERE aufnr = p_aufnr.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE innam
+      INTO gs_header-required_by
+      FROM t024i
+      WHERE iwerk = lv_iwerk
+        AND ingpr = lv_ingpr.
+  ENDIF.
+
+  "------------------------------------------------
+  " Step 2: Activities Section + Machine + Longtext
+  "------------------------------------------------
+  CLEAR gt_act.
+  LOOP AT lt_operations_bapi INTO DATA(ls_oper_bapi).
+    DATA(ls_act) = VALUE ty_act_out(
+        op          = ls_oper_bapi-activity
+        component   = ls_oper_bapi-equipment
+        mp_mt       = ls_oper_bapi-systcond
+        description = ls_oper_bapi-description
+        time        = ls_oper_bapi-duration_normal ).
+
+    " Machine lookup
+    SELECT SINGLE aufpl aplzl
+      INTO (DATA(l_aufpl), DATA(l_aplzl))
+      FROM viauf_afvc
+      WHERE aufnr = p_aufnr
+        AND vornr = ls_oper_bapi-activity.
+
+    IF sy-subrc = 0.
+      SELECT SINGLE equnr
+        INTO lv_eqnr
+        FROM afvc
+        WHERE aufpl = l_aufpl
+          AND aplzl = l_aplzl.
+
+      IF sy-subrc = 0.
+        SELECT SINGLE hequi
+          INTO DATA(l_hequ)
+          FROM v_equi_c
+          WHERE equnr = lv_eqnr.
+
+        IF sy-subrc = 0.
+          SELECT SINGLE eqktx
+            INTO ls_act-machine
+            FROM equi
+            WHERE equnr = l_hequ.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    " Long text
+    SELECT SINGLE mandt txtsp aufpl aplzl
+      INTO (DATA(l_mandt), DATA(l_txtsp), l_aufpl, l_aplzl)
+      FROM viauf_afvc
+      WHERE aufnr = p_aufnr
+        AND vornr = ls_oper_bapi-activity.
+
+    IF sy-subrc = 0.
+      DATA(lt_lines) = VALUE TABLE OF tline( ).
+      CALL FUNCTION 'READ_TEXT'
+        EXPORTING
+          id       = 'AVOT'
+          language = l_txtsp
+          name     = |{ l_mandt }{ l_aufpl ALPHA = OUT }{ l_aplzl ALPHA = OUT }|
+          object   = 'AUFK'
+        TABLES
+          lines    = lt_lines
+        EXCEPTIONS
+          OTHERS   = 1.
+
+      LOOP AT lt_lines INTO DATA(ls_line).
+        CONCATENATE ls_act-longtext ls_line-tdline
+          INTO ls_act-longtext SEPARATED BY space.
+      ENDLOOP.
+    ENDIF.
+
+    APPEND ls_act TO gt_act.
+  ENDLOOP.
+
+  "-----------------------------
+  " Step 3: Materials Section
+  "-----------------------------
+  CLEAR gt_mat.
+  LOOP AT lt_components_bapi INTO DATA(ls_comp_bapi).
+    APPEND VALUE ty_mat_out(
+       op          = ls_comp_bapi-activity
+       material    = ls_comp_bapi-material
+       description = ls_comp_bapi-matl_desc
+       quantity    = ls_comp_bapi-requirement_quantity
+       um          = ls_comp_bapi-requirement_quantity_unit
+       suborder    = ls_comp_bapi-preq_no
+       reservation = ls_comp_bapi-reserv_no ) TO gt_mat.
+  ENDLOOP.
+
+  "-------------------------------------------------------
+  " Step 4: Lock & Padlock Sheet (Technician, Dates, etc.)
+  "-------------------------------------------------------
+  CLEAR gt_lock.
+  SELECT aufpl aplzl pernr
+    FROM viauf_afvc
+    INTO TABLE @DATA(lt_afvc_pos)
+    WHERE aufnr = @p_aufnr.
+
+  LOOP AT lt_afvc_pos INTO DATA(ls_afvc_pos).
+    DATA(ls_lock) = VALUE ty_lock_out( work_order = p_aufnr ).
+
+    " Technician Name
+    SELECT SINGLE ename
+      INTO ls_lock-name
+      FROM pa0001
+      WHERE pernr = ls_afvc_pos-pernr.
+
+    " Dates, times, supervisor keys
+    SELECT SINGLE gstrs gsuzs gltrs gluzs gewrk werks
+      INTO (ls_lock-start_date, ls_lock-start_time,
+            ls_lock-end_date, ls_lock-end_time,
+            lv_gewrk, lv_werks)
+      FROM viaufkst
+      WHERE aufnr = p_aufnr.
+
+    " Supervisor
+    SELECT SINGLE veran
+      INTO DATA(l_veran)
+      FROM crhd
+      WHERE objty = 'A'
+        AND objid = lv_gewrk.
+
+    IF sy-subrc = 0.
+      SELECT SINGLE ktext
+        INTO ls_lock-supervisor
+        FROM tc24
+        WHERE werks = lv_werks
+          AND veran = l_veran.
+    ENDIF.
+
+    " Programmer
+    IF lv_iwerk IS INITIAL OR lv_ingpr IS INITIAL.
+      SELECT SINGLE iwerk ingpr
+        INTO (lv_iwerk, lv_ingpr)
+        FROM afih
+        WHERE aufnr = p_aufnr.
+    ENDIF.
+
+    SELECT SINGLE innam
+      INTO ls_lock-programmer
+      FROM t024i
+      WHERE iwerk = lv_iwerk
+        AND ingpr = lv_ingpr.
+
+    " Equipment
+    SELECT SINGLE equnr
+      INTO ls_lock-equipment
+      FROM afih
+      WHERE aufnr = p_aufnr.
+
+    " Job Description
+    SELECT SINGLE ktext
+      INTO ls_lock-job_desc
+      FROM aufk
+      WHERE aufnr = p_aufnr.
+
+    APPEND ls_lock TO gt_lock.
+  ENDLOOP.
+
+*---------------------------------------------------------------------*
+* In a real scenario, pass gs_header, gt_act, gt_mat, gt_lock to form
+*---------------------------------------------------------------------*
+  WRITE: / '--- HEADER ---', /
+         gs_header-plant_name, gs_header-order, gs_header-short_text.
+  WRITE: / '--- ACTIVITIES ---'.
+  LOOP AT gt_act INTO DATA(l_act).
+    WRITE: / l_act-op, l_act-description, l_act-machine, l_act-longtext.
+  ENDLOOP.
+  WRITE: / '--- MATERIALS ---'.
+  LOOP AT gt_mat INTO DATA(l_mat).
+    WRITE: / l_mat-op, l_mat-material, l_mat-description, l_mat-quantity.
+  ENDLOOP.
+  WRITE: / '--- LOCK & PADLOCK ---'.
+  LOOP AT gt_lock INTO DATA(l_lockrow).
+    WRITE: / l_lockrow-name, l_lockrow-start_date, l_lockrow-supervisor.
+  ENDLOOP.
