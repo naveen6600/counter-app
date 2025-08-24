@@ -1,0 +1,552 @@
+*&---------------------------------------------------------------------*
+*& Treasury Bank Interest Comparison Report - Complete Solution
+*& Author: SAP Developer
+*& Date: 2025
+*& Description: Compare SAP calculated interest vs Bank reported interest
+*&---------------------------------------------------------------------*
+
+"=====================================================================
+" 1. Z-TABLE STRUCTURE: ZQNT_BANK_INT_PARAM
+"=====================================================================
+" Table: ZQNT_BANK_INT_PARAM (Bank Interest Parameters)
+" Fields:
+" - CLIENT (MANDT)
+" - BUKRS (Company Code) - Key
+" - HBKID (House Bank) - Key  
+" - HKTID (Account ID) - Key
+" - BANKN (Bank Account)
+" - ZZKOND (Interest Rate Key)
+" - ZZCALC_METHOD (Calculation Method - e.g., 360/360, 365/360)
+" - ZZVGEXT (External Operation Code)
+" - ZZVGREF (Reference)
+
+"=====================================================================
+" 2. CDS VIEW FOR INTEREST CALCULATION
+"=====================================================================
+@AbapCatalog.viewEnhancementCategory: [#NONE]
+@AccessControl.authorizationCheck: #NOT_REQUIRED
+@EndUserText.label: 'Bank Interest Calculation View'
+@Metadata.ignorePropagatedAnnotations: true
+@ObjectModel.usageType:{
+    serviceQuality: #X,
+    sizeCategory: #S,
+    dataClass: #MIXED
+}
+define view entity ZQNT_I_BANK_INTEREST as select from zqnt_bank_int_param as param
+  left outer join t056p as rates on param.zzkond = rates.referenz
+  left outer join t012k as banks on param.bukrs = banks.bukrs
+                                and param.hbkid = banks.hbkid  
+                                and param.hktid = banks.hktid
+{
+  key param.bukrs as CompanyCode,
+  key param.hbkid as HouseBank,
+  key param.hktid as AccountId,
+  key rates.datab as ValidFrom,
+  param.bankn as BankAccount,
+  param.zzkond as InterestRateKey,
+  param.zzcalc_method as CalculationMethod,
+  param.zzvgext as ExternalOpCode,
+  param.zzvgref as Reference,
+  rates.zsoll as InterestRate,
+  banks.waers as Currency
+}
+
+"=====================================================================
+" 3. MAIN REPORT PROGRAM: ZQNT_TREASURY_INTEREST_RPT
+"=====================================================================
+REPORT zqnt_treasury_interest_rpt.
+
+" Selection Screen
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+PARAMETERS: p_bukrs TYPE bukrs OBLIGATORY MATCHCODE OBJECT h_t001,
+            p_hbkid TYPE hbkid OBLIGATORY MATCHCODE OBJECT h_t012,
+            p_hktid TYPE hktid OBLIGATORY MATCHCODE OBJECT h_t012k.
+SELECT-OPTIONS: s_date FOR sy-datum OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE TEXT-002.
+PARAMETERS: p_daily  RADIOBUTTON GROUP rb1 DEFAULT 'X',
+            p_month  RADIOBUTTON GROUP rb1.
+SELECTION-SCREEN END OF BLOCK b2.
+
+" Data Declarations
+TYPES: BEGIN OF ty_output,
+         date          TYPE dats,
+         bukrs         TYPE bukrs,
+         hbkid         TYPE hbkid,
+         hktid         TYPE hktid,
+         bankn         TYPE bankn,
+         sap_interest  TYPE dmbtr,
+         bank_interest TYPE dmbtr,
+         difference    TYPE dmbtr,
+         balance       TYPE dmbtr,
+         waers         TYPE waers,
+       END OF ty_output.
+
+DATA: gt_output TYPE TABLE OF ty_output,
+      gs_output TYPE ty_output,
+      go_alv    TYPE REF TO cl_salv_table.
+
+" Global Variables
+DATA: gv_acc_id TYPE string,
+      gv_balance TYPE dmbtr,
+      gv_bankn TYPE bankn.
+
+" Constants
+CONSTANTS: lc_msgclass TYPE sy-msgid VALUE 'ZQNT_TREASURY'.
+
+"=====================================================================
+" MAIN PROCESSING
+"=====================================================================
+START-OF-SELECTION.
+  PERFORM validate_input.
+  PERFORM get_bank_account.
+  PERFORM process_data.
+  PERFORM display_alv.
+
+"=====================================================================
+" SUBROUTINES
+"=====================================================================
+
+"---------------------------------------------------------------------
+" Validate Input Parameters
+"---------------------------------------------------------------------
+FORM validate_input.
+  
+  " Check if parameter table exists and has data
+  SELECT SINGLE bukrs FROM zqnt_bank_int_param
+    INTO @DATA(lv_check)
+    WHERE bukrs = @p_bukrs
+      AND hbkid = @p_hbkid  
+      AND hktid = @p_hktid.
+      
+  IF sy-subrc NE 0.
+    MESSAGE e001(zqnt_treasury) WITH 'ZQNT_BANK_INT_PARAM'.
+    " Error: The table ZQNT_BANK_INT_PARAM does NOT contain data needed to run report
+  ENDIF.
+  
+ENDFORM.
+
+"---------------------------------------------------------------------
+" Get Bank Account Number
+"---------------------------------------------------------------------
+FORM get_bank_account.
+  
+  SELECT SINGLE bankn FROM t012k
+    INTO @gv_bankn
+    WHERE bukrs = @p_bukrs
+      AND hbkid = @p_hbkid
+      AND hktid = @p_hktid.
+      
+ENDFORM.
+
+"---------------------------------------------------------------------
+" Main Data Processing
+"---------------------------------------------------------------------
+FORM process_data.
+  
+  DATA: lv_date TYPE dats,
+        lr_date TYPE RANGE OF dats,
+        ls_date LIKE LINE OF lr_date.
+  
+  " Build date range
+  ls_date-sign = 'I'.
+  ls_date-option = 'BT'.
+  ls_date-low = s_date-low.
+  ls_date-high = s_date-high.
+  APPEND ls_date TO lr_date.
+  
+  " Process each date in range
+  lv_date = s_date-low.
+  WHILE lv_date <= s_date-high.
+    
+    CLEAR gs_output.
+    gs_output-date = lv_date.
+    gs_output-bukrs = p_bukrs.
+    gs_output-hbkid = p_hbkid.
+    gs_output-hktid = p_hktid.
+    gs_output-bankn = gv_bankn.
+    
+    " Calculate SAP Interest
+    PERFORM calculate_sap_interest USING lv_date
+                                   CHANGING gs_output-sap_interest
+                                            gs_output-waers
+                                            gs_output-balance.
+    
+    " Get Bank Interest from MT940
+    PERFORM get_bank_interest USING lv_date
+                              CHANGING gs_output-bank_interest.
+    
+    " Calculate Difference  
+    gs_output-difference = gs_output-sap_interest - gs_output-bank_interest.
+    
+    " Add to output table based on view selection
+    IF p_daily = 'X'.
+      APPEND gs_output TO gt_output.
+    ELSEIF p_month = 'X' AND lv_date = s_date-high.
+      " For monthly view, only show last date but sum all values
+      PERFORM sum_monthly_values USING lr_date.
+      APPEND gs_output TO gt_output.
+    ENDIF.
+    
+    lv_date = lv_date + 1.
+    
+  ENDWHILE.
+  
+ENDFORM.
+
+"---------------------------------------------------------------------
+" Calculate SAP Interest using Formula
+"---------------------------------------------------------------------
+FORM calculate_sap_interest USING iv_date TYPE dats
+                            CHANGING cv_interest TYPE dmbtr
+                                     cv_currency TYPE waers
+                                     cv_balance TYPE dmbtr.
+  
+  DATA: lv_rate TYPE p DECIMALS 5,
+        lv_calc_method TYPE string,
+        lv_base TYPE i,
+        lv_days TYPE i VALUE 1.
+  
+  " Get interest rate for the date
+  SELECT SINGLE a~zsoll, b~zzcalc_method, b~waers
+    FROM t056p AS a
+    INNER JOIN zqnt_bank_int_param AS b
+      ON a~referenz = b~zzkond
+    INTO (@lv_rate, @lv_calc_method, @cv_currency)
+    WHERE b~bukrs = @p_bukrs
+      AND b~hbkid = @p_hbkid
+      AND b~hktid = @p_hktid
+      AND a~datab <= @iv_date
+    ORDER BY a~datab DESCENDING.
+    
+  IF sy-subrc NE 0.
+    MESSAGE e002(zqnt_treasury) WITH p_hktid iv_date.
+    " Error: No interest rate found for account
+    RETURN.
+  ENDIF.
+  
+  " Get account balance
+  PERFORM get_account_balance CHANGING cv_balance.
+  
+  " Parse calculation method (e.g., "360/360")
+  SPLIT lv_calc_method AT '/' INTO DATA(lv_numerator) DATA(lv_denominator).
+  lv_base = lv_denominator.
+  
+  " Apply interest calculation formula
+  " Balance * ((1 + Rate/100) ^ (Days/Base) - 1)
+  DATA: lv_rate_decimal TYPE p DECIMALS 8,
+        lv_power_factor TYPE p DECIMALS 8,
+        lv_result TYPE p DECIMALS 2.
+  
+  lv_rate_decimal = lv_rate / 100.
+  lv_power_factor = lv_days / lv_base.
+  
+  " Simplified calculation: Balance * Rate * Days / Base
+  lv_result = cv_balance * lv_rate_decimal * lv_days / lv_base.
+  
+  cv_interest = lv_result.
+  
+ENDFORM.
+
+"---------------------------------------------------------------------
+" Get Account Balance using Function Module
+"---------------------------------------------------------------------
+FORM get_account_balance CHANGING cv_balance TYPE dmbtr.
+  
+  " First get ACC_ID from FCLM_BAM_ACLINK2
+  DATA: lv_acc_id TYPE string.
+  
+  CALL FUNCTION 'FCLM_BAM_ACLINK2'
+    EXPORTING
+      iv_bukrs = p_bukrs
+      iv_hbkid = p_hbkid  
+      iv_hktid = p_hktid
+    IMPORTING
+      ev_acc_id = lv_acc_id
+    EXCEPTIONS
+      not_found = 1
+      OTHERS = 2.
+      
+  IF sy-subrc = 0.
+    " Get account position/balance
+    CALL FUNCTION 'FCLM_BAM_GETPOSITION'
+      EXPORTING
+        iv_acc_id = lv_acc_id
+      IMPORTING  
+        ev_closingbalance = cv_balance
+      EXCEPTIONS
+        not_found = 1
+        OTHERS = 2.
+  ENDIF.
+  
+  IF sy-subrc NE 0.
+    cv_balance = 0.
+  ENDIF.
+  
+ENDFORM.
+
+"---------------------------------------------------------------------
+" Get Bank Interest from MT940 Statements
+"---------------------------------------------------------------------
+FORM get_bank_interest USING iv_date TYPE dats
+                       CHANGING cv_bank_interest TYPE dmbtr.
+  
+  DATA: lv_kukey TYPE kukey,
+        lv_vgext TYPE vgext,
+        lv_vgref TYPE vgref.
+  
+  " Get external operation parameters
+  SELECT SINGLE zzvgext, zzvgref
+    FROM zqnt_bank_int_param
+    INTO (@lv_vgext, @lv_vgref)
+    WHERE bukrs = @p_bukrs
+      AND hbkid = @p_hbkid
+      AND hktid = @p_hktid.
+  
+  " Step 1: Get short key from FEBKO
+  SELECT SINGLE kukey
+    FROM febko
+    INTO @lv_kukey
+    WHERE azdat = @iv_date
+      AND hbkid = @p_hbkid
+      AND hktid = @p_hktid.
+      
+  IF sy-subrc = 0.
+    " Step 2: Get interest amount from FEBEP
+    SELECT SINGLE kwbtr
+      FROM febep  
+      INTO @cv_bank_interest
+      WHERE kukey = @lv_kukey
+        AND vgext = @lv_vgext
+        AND vgref = @lv_vgref.
+        
+    IF sy-subrc NE 0.
+      cv_bank_interest = 0.
+    ENDIF.
+  ELSE.
+    cv_bank_interest = 0.
+  ENDIF.
+  
+ENDFORM.
+
+"---------------------------------------------------------------------
+" Sum Monthly Values for Monthly View
+"---------------------------------------------------------------------
+FORM sum_monthly_values USING ir_date TYPE RANGE OF dats.
+  
+  DATA: lv_total_sap TYPE dmbtr,
+        lv_total_bank TYPE dmbtr,
+        lv_date TYPE dats.
+        
+  " Sum all SAP and Bank interest values in date range
+  lv_date = s_date-low.
+  WHILE lv_date <= s_date-high.
+    
+    " Add SAP interest calculation for each day
+    DATA: lv_daily_sap TYPE dmbtr,
+          lv_daily_bank TYPE dmbtr,
+          lv_dummy_curr TYPE waers,
+          lv_dummy_bal TYPE dmbtr.
+          
+    PERFORM calculate_sap_interest USING lv_date
+                                   CHANGING lv_daily_sap
+                                            lv_dummy_curr  
+                                            lv_dummy_bal.
+    lv_total_sap = lv_total_sap + lv_daily_sap.
+    
+    " Add bank interest for each day
+    PERFORM get_bank_interest USING lv_date
+                              CHANGING lv_daily_bank.
+    lv_total_bank = lv_total_bank + lv_daily_bank.
+    
+    lv_date = lv_date + 1.
+  ENDWHILE.
+  
+  " Update output structure with totals
+  gs_output-sap_interest = lv_total_sap.
+  gs_output-bank_interest = lv_total_bank.
+  gs_output-difference = lv_total_sap - lv_total_bank.
+  
+ENDFORM.
+
+"---------------------------------------------------------------------
+" Display ALV Report
+"---------------------------------------------------------------------
+FORM display_alv.
+  
+  DATA: lo_columns TYPE REF TO cl_salv_columns_table,
+        lo_column  TYPE REF TO cl_salv_column_table,
+        lo_functions TYPE REF TO cl_salv_functions_list.
+  
+  TRY.
+    " Create ALV object
+    CALL METHOD cl_salv_table=>factory
+      IMPORTING
+        r_salv_table = go_alv
+      CHANGING  
+        t_table      = gt_output.
+        
+    " Enable functions
+    lo_functions = go_alv->get_functions( ).
+    lo_functions->set_all( 'X' ).
+    
+    " Get columns object
+    lo_columns = go_alv->get_columns( ).
+    lo_columns->set_optimize( 'X' ).
+    
+    " Set column texts
+    lo_column ?= lo_columns->get_column( 'DATE' ).
+    lo_column->set_medium_text( 'Date' ).
+    lo_column->set_short_text( 'Date' ).
+    
+    lo_column ?= lo_columns->get_column( 'BUKRS' ).  
+    lo_column->set_medium_text( 'Company' ).
+    lo_column->set_short_text( 'Co.Code' ).
+    
+    lo_column ?= lo_columns->get_column( 'HBKID' ).
+    lo_column->set_medium_text( 'House Bank' ).
+    lo_column->set_short_text( 'HBank' ).
+    
+    lo_column ?= lo_columns->get_column( 'HKTID' ).
+    lo_column->set_medium_text( 'Account ID' ).
+    lo_column->set_short_text( 'Acc.ID' ).
+    
+    lo_column ?= lo_columns->get_column( 'BANKN' ).
+    lo_column->set_medium_text( 'Bank Account' ).
+    lo_column->set_short_text( 'Account' ).
+    
+    lo_column ?= lo_columns->get_column( 'SAP_INTEREST' ).
+    lo_column->set_medium_text( 'SAP Interest' ).
+    lo_column->set_short_text( 'SAP Int.' ).
+    
+    lo_column ?= lo_columns->get_column( 'BANK_INTEREST' ).
+    lo_column->set_medium_text( 'Bank Interest' ).
+    lo_column->set_short_text( 'Bank Int.' ).
+    
+    lo_column ?= lo_columns->get_column( 'DIFFERENCE' ).
+    lo_column->set_medium_text( 'Difference' ).
+    lo_column->set_short_text( 'Diff.' ).
+    
+    lo_column ?= lo_columns->get_column( 'BALANCE' ).
+    lo_column->set_medium_text( 'Account Balance' ).
+    lo_column->set_short_text( 'Balance' ).
+    
+    " Display ALV
+    go_alv->display( ).
+    
+  CATCH cx_salv_msg INTO DATA(lx_salv_msg).
+    MESSAGE lx_salv_msg TYPE 'E'.
+  ENDTRY.
+  
+ENDFORM.
+
+"=====================================================================
+" 4. MAINTENANCE VIEW PROGRAM FOR Z-TABLE: ZQNT_SM30_BANK_PARAM
+"=====================================================================
+REPORT zqnt_sm30_bank_param.
+
+" Simple maintenance interface for parameter table
+TABLES: zqnt_bank_int_param.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+PARAMETERS: p_bukrs TYPE bukrs OBLIGATORY,
+            p_hbkid TYPE hbkid OBLIGATORY,
+            p_hktid TYPE hktid OBLIGATORY,
+            p_bankn TYPE bankn,
+            p_kond  TYPE zzkond,
+            p_calc  TYPE char10,
+            p_vgext TYPE vgext,
+            p_vgref TYPE vgref.
+            
+PARAMETERS: p_create RADIOBUTTON GROUP rb1,
+            p_update RADIOBUTTON GROUP rb1,
+            p_delete RADIOBUTTON GROUP rb1.
+SELECTION-SCREEN END OF BLOCK b1.
+
+START-OF-SELECTION.
+  
+  CASE 'X'.
+    WHEN p_create.
+      PERFORM create_entry.
+    WHEN p_update.  
+      PERFORM update_entry.
+    WHEN p_delete.
+      PERFORM delete_entry.
+  ENDCASE.
+
+FORM create_entry.
+  zqnt_bank_int_param-client = sy-mandt.
+  zqnt_bank_int_param-bukrs = p_bukrs.
+  zqnt_bank_int_param-hbkid = p_hbkid.
+  zqnt_bank_int_param-hktid = p_hktid.
+  zqnt_bank_int_param-bankn = p_bankn.
+  zqnt_bank_int_param-zzkond = p_kond.
+  zqnt_bank_int_param-zzcalc_method = p_calc.
+  zqnt_bank_int_param-zzvgext = p_vgext.
+  zqnt_bank_int_param-zzvgref = p_vgref.
+  
+  INSERT zqnt_bank_int_param.
+  IF sy-subrc = 0.
+    COMMIT WORK.
+    MESSAGE 'Entry created successfully' TYPE 'S'.
+  ELSE.
+    MESSAGE 'Error creating entry' TYPE 'E'.
+  ENDIF.
+ENDFORM.
+
+FORM update_entry.
+  UPDATE zqnt_bank_int_param SET
+    bankn = p_bankn,
+    zzkond = p_kond,
+    zzcalc_method = p_calc,
+    zzvgext = p_vgext,
+    zzvgref = p_vgref
+  WHERE bukrs = p_bukrs
+    AND hbkid = p_hbkid
+    AND hktid = p_hktid.
+    
+  IF sy-subrc = 0.
+    COMMIT WORK.
+    MESSAGE 'Entry updated successfully' TYPE 'S'.
+  ELSE.
+    MESSAGE 'Entry not found for update' TYPE 'E'.
+  ENDIF.
+ENDFORM.
+
+FORM delete_entry.
+  DELETE FROM zqnt_bank_int_param
+  WHERE bukrs = p_bukrs
+    AND hbkid = p_hbkid  
+    AND hktid = p_hktid.
+    
+  IF sy-subrc = 0.
+    COMMIT WORK.
+    MESSAGE 'Entry deleted successfully' TYPE 'S'.
+  ELSE.
+    MESSAGE 'Entry not found for deletion' TYPE 'E'.
+  ENDIF.
+ENDFORM.
+
+"=====================================================================
+" TEXT ELEMENTS (TO BE DEFINED IN SE80)
+"=====================================================================
+" TEXT-001: Selection Parameters
+" TEXT-002: Display Options
+
+"=====================================================================
+" MESSAGE CLASS: ZQNT_TREASURY (TO BE CREATED IN SE91)  
+"=====================================================================
+" 001: The table & does NOT contain data needed to run report
+" 002: No interest rate found for account & on date &
+
+"=====================================================================
+" TRANSPORT INSTRUCTIONS
+"=====================================================================
+" 1. Create Z-table ZQNT_BANK_INT_PARAM with maintenance view
+" 2. Create CDS view ZQNT_I_BANK_INTEREST  
+" 3. Create main report ZQNT_TREASURY_INTEREST_RPT
+" 4. Create maintenance program ZQNT_SM30_BANK_PARAM
+" 5. Create message class ZQNT_TREASURY with defined messages
+" 6. Configure OB83 transaction with interest rates
+" 7. Test with sample data in parameter table
